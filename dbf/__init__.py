@@ -41,6 +41,8 @@ import os
 import struct
 import sys
 import time
+import traceback
+import warnings
 import weakref
 
 from array import array
@@ -72,7 +74,7 @@ else:
     long = int
     xrange = range
 
-version = 0, 97, 11
+version = 0, 98, 3
 
 NoneType = type(None)
 
@@ -841,6 +843,8 @@ class DoNotIndex(DbfWarning):
     def __init__(self):
         DbfWarning.__init__(self, self.message)
 
+class FieldNameWarning(UserWarning):
+    message = 'non-standard characters in field name'
 
 # wrappers around datetime and logical objects to allow null values
 
@@ -1063,21 +1067,37 @@ class Date(object):
             raise AttributeError('NullDate object has no attribute %s' % name)
 
     def __ge__(self, other):
-        if isinstance(other, (datetime.date)):
-            return self._date >= other
-        elif isinstance(other, (Date)):
-            if other:
-                return self._date >= other._date
-            return False
+        if self:
+            if isinstance(other, (datetime.date)):
+                return self._date >= other
+            elif isinstance(other, (Date)):
+                if other:
+                    return self._date >= other._date
+                return True
+        else:
+            if isinstance(other, (datetime.date)):
+                return False
+            elif isinstance(other, (Date)):
+                if other:
+                    return False
+                return True
         return NotImplemented
 
     def __gt__(self, other):
-        if isinstance(other, (datetime.date)):
-            return self._date > other
-        elif isinstance(other, (Date)):
-            if other:
-                return self._date > other._date
-            return True
+        if self:
+            if isinstance(other, (datetime.date)):
+                return self._date > other
+            elif isinstance(other, (Date)):
+                if other:
+                    return self._date > other._date
+                return True
+        else:
+            if isinstance(other, (datetime.date)):
+                return False
+            elif isinstance(other, (Date)):
+                if other:
+                    return False
+                return False
         return NotImplemented
 
     def __hash__(self):
@@ -2915,6 +2935,7 @@ class Record(object):
     def __getattr__(self, name):
         if name[0:2] == '__' and name[-2:] == '__':
             raise AttributeError('Method %s is not implemented.' % name)
+        name = name.lower()
         if not name in self._meta.fields:
             raise FieldMissingError(name)
         if name in self._memos:
@@ -3025,7 +3046,7 @@ class Record(object):
         return '\n'.join(result)
 
     def __repr__(self):
-        return to_bytes(self._data)
+        return '%r' % to_bytes(self._data)
 
     def _commit_flux(self):
         """
@@ -3361,6 +3382,7 @@ class RecordTemplate(object):
     def __getattr__(self, name):
         if name[0:2] == '__' and name[-2:] == '__':
             raise AttributeError('Method %s is not implemented.' % name)
+        name = name.lower()
         if not name in self._meta.fields:
             raise FieldMissingError(name)
         if name in self._memos:
@@ -3458,7 +3480,7 @@ class RecordTemplate(object):
 
 
     def __repr__(self):
-        return to_bytes(self._data)
+        return '%r' % to_bytes(self._data)
 
     def __str__(self):
         result = []
@@ -5055,7 +5077,7 @@ class Table(_Navigation):
             specs = specs.strip(sep).split(sep)
         else:
             specs = list(specs)
-        specs = [s.strip() for s in specs]
+        specs = [s.strip().lower() for s in specs]
         return specs
 
     def _nav_check(self):
@@ -5229,13 +5251,22 @@ class Table(_Navigation):
             meta.header.data
         else:
             base, ext = os.path.splitext(filename)
-            if ext.lower() != '.dbf':
-                meta.filename = filename + '.dbf'
-                searchname = filename + '.[Db][Bb][Ff]'
+            search_name = None
+            if ext == '.':
+                # use filename without the '.'
+                search_name = base
+                matches = glob(search_name)
+            elif ext.lower() == '.dbf':
+                # use filename as-is
+                matches = glob(filename)
             else:
-                meta.filename = filename
-                searchname = filename
-            matches = glob(searchname)
+                meta.filename = filename + '.dbf'
+                search_name = filename + '.[Db][Bb][Ff]'
+                matches = glob(search_name)
+                if not matches:
+                    meta.filename = filename
+                    search_name = filename
+                    matches = glob(search_name)
             if len(matches) == 1:
                 meta.filename = matches[0]
             elif matches:
@@ -5344,9 +5375,6 @@ class Table(_Navigation):
                 raise DbfError("Unknown table type: %s" % dbf_type)
             return object.__new__(table)
         else:
-            base, ext = os.path.splitext(filename)
-            if ext.lower() != '.dbf':
-                filename = filename + '.dbf'
             possibles = guess_table_type(filename)
             if len(possibles) == 1:
                 return object.__new__(possibles[0][2])
@@ -5502,7 +5530,9 @@ class Table(_Navigation):
         meta = self._meta
         if meta.status != READ_WRITE:
             raise DbfError('%s not in read/write mode, unable to add fields (%s)' % (meta.filename, meta.status))
-        fields = self.structure() + self._list_fields(field_specs, sep=u';')
+        fields = self.structure()
+        original_fields = len(fields)
+        fields += self._list_fields(field_specs, sep=u';')
         null_fields = any(['null' in f.lower() for f in fields])
         if (len(fields) + null_fields) > meta.max_fields:
             raise DbfError(
@@ -5526,7 +5556,7 @@ class Table(_Navigation):
 
         meta.blankrecord = None
         null_index = -1
-        for field in fields:
+        for field_seq, field in enumerate(fields):
             if not field:
                 continue
             field = field.lower()
@@ -5545,8 +5575,15 @@ class Table(_Navigation):
                             break
             except IndexError:
                 raise FieldSpecError('bad field spec: %r' % field)
-            if name[0] == '_' or name[0].isdigit() or not name.replace('_', '').isalnum():
-                raise FieldSpecError("%s invalid:  field names must start with a letter, and can only contain letters, digits, and _" % name)
+            if field_seq >= original_fields and (name[0] == '_' or name[0].isdigit() or not name.replace('_', '').isalnum()):
+                # find appropriate line to point warning to
+                for i, frame in enumerate(reversed(traceback.extract_stack()), start=1):
+                    if frame[0] == __file__ and frame[2] == 'resize_field':
+                        # ignore
+                        break
+                    elif frame[0] != __file__ or frame[2] not in ('__init__','add_fields'):
+                        warnings.warn('"%s invalid:  field names should start with a letter, and only contain letters, digits, and _' % name, FieldNameWarning, stacklevel=i)
+                        break
             if name in meta.fields:
                 raise DbfError("Field '%s' already exists" % name)
             field_type = format
@@ -5824,6 +5861,7 @@ class Table(_Navigation):
         """
         returns (field type, size, dec, class) of field
         """
+        field = field.lower()
         if field in self.field_names:
             field = self._meta[field]
             return FieldInfo(field[TYPE], field[LENGTH], field[DECIMALS], field[CLASS])
@@ -5877,6 +5915,7 @@ class Table(_Navigation):
         """
         returns True if field allows Nulls
         """
+        field = field.lower()
         if field not in self.field_names:
             raise FieldMissingError(field)
         return bool(self._meta[field][FLAGS] & NULLABLE)
@@ -5975,6 +6014,8 @@ class Table(_Navigation):
         """
         renames an existing field
         """
+        oldname = oldname.lower()
+        newname = newname.lower()
         meta = self._meta
         if meta.status != READ_WRITE:
             raise DbfError('%s not in read/write mode, unable to change field names' % meta.filename)
@@ -5984,7 +6025,6 @@ class Table(_Navigation):
             raise FieldMissingError("field --%s-- does not exist -- cannot rename it." % oldname)
         if newname[0] == '_' or newname[0].isdigit() or not newname.replace('_', '').isalnum():
             raise FieldSpecError("field names cannot start with _ or digits, and can only contain the _, letters, and digits")
-        newname = newname.lower()
         if newname in self._meta.fields:
             raise DbfError("field --%s-- already exists" % newname)
         if len(newname) > 10:
@@ -6010,6 +6050,7 @@ class Table(_Navigation):
                 raise DbfError("field %s not in table -- resize aborted" % candidate)
             elif self.field_info(candidate).field_type != FieldType.CHAR:
                 raise DbfError("field %s is not Character -- resize aborted" % candidate)
+        old_table = None
         if self:
             old_table = self.create_backup()
             self.zap()
@@ -8401,7 +8442,7 @@ def export(table_or_records, filename=None, field_names=None, format='csv', head
                     fields.append(unicode(data))
                 fd.write('\t'.join(fields) + '\n')
         else: # format == 'fixed'
-            with open("%s_layout.txt" % os.path.splitext(filename)[0], 'w', encoding=encoding) as header:
+            with codecs.open("%s_layout.txt" % os.path.splitext(filename)[0], 'w', encoding=encoding) as header:
                 header.write("%-15s  Size\n" % "Field Name")
                 header.write("%-15s  ----\n" % ("-" * 15))
                 sizes = []
@@ -8581,17 +8622,31 @@ def table_type(filename):
     """
     returns text representation of a table's dbf version
     """
+    actual_filename = None
+    search_name = None
     base, ext = os.path.splitext(filename)
-    if ext == '':
-        filename = base + '.[Dd][Bb][Ff]'
+    if ext == '.':
+        # use filename without the '.'
+        search_name = base
+        matches = glob(search_name)
+    elif ext.lower() == '.dbf':
+        # use filename as-is
+        search_name = filename
+        matches = glob(search_name)
+    else:
+        search_name = base + '.[Dd][Bb][Ff]'
         matches = glob(filename)
-        if matches:
-            filename = matches[0]
-        else:
-            filename = base + '.dbf'
-    if not os.path.exists(filename):
-        raise DbfError('File %s not found' % filename)
-    fd = open(filename, 'rb')
+        if not matches:
+            # back to original name
+            search_name = filename
+            matches = glob(search_name)
+    if len(matches) == 1:
+        actual_filename = matches[0]
+    elif matches:
+        raise DbfError("please specify exactly which of %r you want" % (matches, ))
+    else:
+        raise DbfError('File %r not found' % search_name)
+    fd = open(actual_filename, 'rb')
     version = ord(fd.read(1))
     fd.close()
     fd = None
@@ -8740,6 +8795,7 @@ def gather(record, data, drop=False):
         record_fields = field_names(record)
         for key in field_names(data):
             value = data[key]
+            key = key.lower()
             if not key in record_fields:
                 if drop:
                     continue
